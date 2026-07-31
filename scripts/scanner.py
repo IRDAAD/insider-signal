@@ -1,27 +1,22 @@
 #!/usr/bin/env python3
 """
-INSIDER BUY SCANNER — SEC Form 4 open-market purchase detector.
+INSIDER BUY SCANNER - SEC Form 4 open-market purchase detector.
 
-What it does, end to end:
   1. Pulls the SEC EDGAR daily index of all filings for a given day.
   2. Keeps only Form 4s (insider transaction reports).
   3. Fetches each Form 4's XML and parses every transaction.
-  4. Keeps only TRANSACTION CODE "P" — open-market purchases with the
-     insider's own money. (Ignores option grants "A", sales "S",
-     tax withholding "F", gifts "G" — the noise.)
+  4. Keeps only TRANSACTION CODE "P" - open-market purchases with the
+     insider's own money. (Ignores grants "A", sales "S", tax "F", gifts "G".)
   5. Scores what's left and writes alerts.json, ranked by signal.
 
-Run it anywhere with normal internet access (home machine, $5 VPS,
-or a free GitHub Action on a schedule):
+    python3 scanner.py                 # scan yesterday
+    python3 scanner.py 2026-07-30      # scan a specific day
 
-    python3 scanner.py                  # scan yesterday
-    python3 scanner.py 2026-07-29      # scan a specific day
-
-SEC asks for a real contact in the User-Agent — keep yours in it.
-Rate limit: stay under 10 requests/sec. This script sleeps 0.12s
-between fetches, which keeps you comfortably legal.
+SEC blocks requests without a proper User-Agent and full headers.
+Rate limit: stay under 10 requests/sec.
 """
 
+import gzip
 import json
 import os
 import re
@@ -32,20 +27,38 @@ from datetime import date, datetime, timedelta
 from xml.etree import ElementTree as ET
 
 # ----------------------------------------------------------------------
-# SEC requires a real contact. Set SEC_CONTACT as a GitHub secret,
-# or it falls back to the value below.
 CONTACT = os.environ.get("SEC_CONTACT", "Insider Signal diegoball2344@gmail.com")
-UA = {"User-Agent": CONTACT}
-MIN_DOLLARS = 100_000        # ignore buys under this
-SLEEP = 0.12                 # seconds between SEC requests (rate limit)
+
+# SEC returns 403 unless these headers are all present and well-formed.
+UA = {
+    "User-Agent": CONTACT,
+    "Accept-Encoding": "gzip, deflate",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Connection": "keep-alive",
+}
+
+MIN_DOLLARS = 100000         # ignore buys under this
+SLEEP = 0.15                 # seconds between SEC requests (rate limit)
 OUT = "alerts.json"
 # ----------------------------------------------------------------------
 
 
-def get(url):
-    req = urllib.request.Request(url, headers=UA)
-    with urllib.request.urlopen(req, timeout=30) as r:
-        return r.read()
+def get(url, tries=3):
+    """Fetch a URL with SEC-compliant headers, gzip handling, and retries."""
+    last = None
+    for attempt in range(tries):
+        try:
+            req = urllib.request.Request(url, headers=UA)
+            with urllib.request.urlopen(req, timeout=30) as r:
+                data = r.read()
+                if r.headers.get("Content-Encoding") == "gzip":
+                    data = gzip.decompress(data)
+                return data
+        except Exception as e:
+            last = e
+            time.sleep(2.0 * (attempt + 1))   # back off; SEC throttles hard
+    raise last
 
 
 def quarter(d):
@@ -56,26 +69,24 @@ def daily_form4_index(d):
     """Return [{cik, company, path}] for every Form 4 filed on date d."""
     url = ("https://www.sec.gov/Archives/edgar/daily-index/"
            "%d/%s/form.%s.idx" % (d.year, quarter(d), d.strftime("%Y%m%d")))
+    print("  index: %s" % url)
     try:
         raw = get(url).decode("latin-1")
     except Exception as e:
         print("  could not fetch daily index: %s" % e)
-        return []                      # weekend / holiday / not posted yet
+        return []
     out = []
     for line in raw.splitlines():
-        # fixed-width-ish: FORM TYPE | COMPANY | CIK | DATE | PATH
-        if not line.startswith("4 "):  # exactly form "4", not 4/A, 424 etc.
+        if not line.startswith("4 "):   # exactly form "4", not 4/A, 424 etc.
             continue
         parts = re.split(r"\s{2,}", line.strip())
         if len(parts) >= 5:
-            out.append({"company": parts[1], "cik": parts[2],
-                        "path": parts[4]})
+            out.append({"company": parts[1], "cik": parts[2], "path": parts[4]})
     return out
 
 
 def filing_xml_url(path):
     """Given the .txt path from the index, find the filing's primary XML."""
-    # path like edgar/data/1234567/0001234567-26-000123.txt
     m = re.match(r"edgar/data/(\d+)/([\d-]+)\.txt", path)
     if not m:
         return None
@@ -85,7 +96,6 @@ def filing_xml_url(path):
         listing = get(base + "/").decode("utf-8", "ignore")
     except Exception:
         return None
-    # first .xml that isn't the index
     xmls = re.findall(r'href="[^"]*/([^"/]+\.xml)"', listing)
     for x in xmls:
         if "index" not in x.lower():
@@ -154,8 +164,7 @@ def parse_form4(xml_bytes):
         "is_ceo": is_ceo, "is_officer": is_officer,
         "is_director": is_dir, "is_ten_pct": is_ten,
         "total_value": total,
-        "avg_price": round(sum(b["price"] * b["shares"] for b in buys)
-                           / bought, 2),
+        "avg_price": round(sum(b["price"] * b["shares"] for b in buys) / bought, 2),
         "shares": int(bought),
         "stake_increase_pct": stake_pct,
         "transactions": buys,
@@ -197,10 +206,20 @@ def main():
         d = datetime.strptime(sys.argv[1], "%Y-%m-%d").date()
     else:
         d = date.today() - timedelta(days=1)
-    print("Scanning Form 4s filed %s ..." % d)
 
-    idx = daily_form4_index(d)
-    print("  %d Form 4 filings in the daily index" % len(idx))
+    # SEC posts nothing on weekends/holidays. Walk back to the last weekday
+    # that actually has an index, up to 5 days.
+    idx = []
+    for back in range(5):
+        day = d - timedelta(days=back)
+        if day.weekday() >= 5:        # Sat/Sun
+            continue
+        print("Scanning Form 4s filed %s ..." % day)
+        idx = daily_form4_index(day)
+        print("  %d Form 4 filings in the daily index" % len(idx))
+        if idx:
+            d = day
+            break
 
     alerts = []
     for i, f in enumerate(idx):
@@ -217,9 +236,10 @@ def main():
             parsed["score"] = score(parsed)
             parsed["filing_url"] = xml_url
             alerts.append(parsed)
-            print("  BUY  %-6s $%12s  %s" % (parsed["ticker"],
-                                             "{:,}".format(parsed["total_value"]),
-                                             parsed["insider"]))
+            print("  BUY  %-6s $%14s  %s" % (
+                parsed["ticker"],
+                "{:,}".format(parsed["total_value"]),
+                parsed["insider"]))
         if (i + 1) % 100 == 0:
             print("  ... %d/%d scanned" % (i + 1, len(idx)))
 

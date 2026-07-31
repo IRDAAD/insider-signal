@@ -1,9 +1,10 @@
 name: Daily insider scan
 
-# SEC blocks some GitHub runner IPs (shared, burned by other scrapers).
-# Each run gets a DIFFERENT runner, so we try several times each morning.
-# The scanner refuses to overwrite good data with a blocked/empty run,
-# so the first success wins and later attempts are harmless.
+# SEC blocks by IP reputation. Ubuntu runners (Azure) are heavily burned by
+# other scrapers. macOS runners sit on a different IP range and are free on
+# public repos - so we try macOS first, Ubuntu as a backup.
+# Each run also lands on a different machine, so we try several times a
+# morning. The scanner never overwrites good data with a blocked run.
 on:
   schedule:
     - cron: "15 11 * * 2-6"   # 7:15 AM ET
@@ -22,15 +23,10 @@ concurrency:
 
 jobs:
   scan:
-    runs-on: ubuntu-latest
+    runs-on: macos-latest
     steps:
       - name: Check out the repo
         uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
 
       - name: Run the scanner
         env:

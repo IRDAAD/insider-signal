@@ -4,15 +4,16 @@ INSIDER BUY SCANNER - SEC Form 4 open-market purchase detector.
 
 Finds insiders buying their own company's stock with their own money.
 
-  1. Pulls recent Form 4 filings from EDGAR's "getcurrent" Atom feed.
-     (NOTE: SEC returns 403 on the daily-index .idx files from cloud
-     runners, but the Atom feed and the Archives XML both work fine.)
-  2. Fetches each filing's XML.
-  3. Keeps only TRANSACTION CODE "P" - open-market purchases.
-     (Ignores grants "A", sales "S", tax withholding "F", gifts "G".)
-  4. Scores what's left and writes alerts.json, ranked by conviction.
+Data sources, in order of preference (SEC 403s some endpoints from cloud
+runners, so we try several and use whichever answers):
+  1. EDGAR full-text search API (efts.sec.gov) - full day coverage
+  2. EDGAR "getcurrent" Atom feed - most recent filings, proven to work
 
-    python3 scanner.py            # scan the most recent filings
+Then for each filing: fetch the XML, keep only TRANSACTION CODE "P"
+(open-market purchase with the insider's own money), score, and rank.
+Ignores grants "A", sales "S", tax withholding "F", gifts "G".
+
+    python3 scanner.py
 
 Rate limit: stay under 10 requests/sec.
 """
@@ -21,10 +22,9 @@ import gzip
 import json
 import os
 import re
-import sys
 import time
 import urllib.request
-from datetime import date, datetime
+from datetime import date, timedelta
 from xml.etree import ElementTree as ET
 
 # ----------------------------------------------------------------------
@@ -40,8 +40,6 @@ UA = {
 
 MIN_DOLLARS = 100000     # ignore buys under this
 SLEEP = 0.15             # seconds between SEC requests (rate limit)
-PAGE = 100               # filings per Atom page
-MAX_PAGES = 12           # up to 1200 recent filings
 OUT = "alerts.json"
 # ----------------------------------------------------------------------
 
@@ -59,52 +57,74 @@ def get(url, tries=3):
                 return data
         except Exception as e:
             last = e
-            time.sleep(2.0 * (attempt + 1))
+            time.sleep(1.5 * (attempt + 1))
     raise last
 
 
-def recent_form4_filings():
-    """Return filing directory URLs for recent Form 4s, via the Atom feed."""
-    seen, dirs = set(), []
-    for page in range(MAX_PAGES):
-        url = ("https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent"
-               "&type=4&company=&dateb=&owner=include&count=%d&start=%d"
-               "&output=atom" % (PAGE, page * PAGE))
+def from_full_text_search():
+    """Primary source: EDGAR full-text search. Returns list of XML URLs."""
+    urls = []
+    end = date.today()
+    start = end - timedelta(days=4)          # cover a long weekend
+    base = ("https://efts.sec.gov/LATEST/search-index?q=%22%22&forms=4"
+            "&dateRange=custom&startdt=" + start.isoformat() +
+            "&enddt=" + end.isoformat())
+    for page in range(40):                   # up to 400 filings
+        url = base + ("&from=%d" % (page * 10))
         try:
             raw = get(url).decode("utf-8", "ignore")
+            data = json.loads(raw)
         except Exception as e:
-            print("  feed page %d failed: %s" % (page, e))
+            print("  fts page %d stopped: %s" % (page, e))
             break
-
-        # every filing links to .../data/<cik>/<accession>/<acc>-index.htm
-        hrefs = re.findall(r'href="(https://www\.sec\.gov/Archives/edgar/data/'
-                           r'\d+/\d+/[^"]*-index\.htm)"', raw)
-        if not hrefs:
+        hits = data.get("hits", {}).get("hits", [])
+        if not hits:
             break
-        new = 0
-        for h in hrefs:
-            base = h.rsplit("/", 1)[0]
-            if base not in seen:
-                seen.add(base)
-                dirs.append(base)
-                new += 1
-        print("  page %d: %d filings (%d new)" % (page + 1, len(hrefs), new))
-        if new == 0:
-            break
+        for h in hits:
+            hid = h.get("_id", "")           # "0001234567-26-000123:form4.xml"
+            ciks = h.get("_source", {}).get("ciks", [])
+            if ":" not in hid or not ciks:
+                continue
+            acc, fname = hid.split(":", 1)
+            cik = str(int(ciks[0]))          # strip leading zeros
+            urls.append("https://www.sec.gov/Archives/edgar/data/%s/%s/%s"
+                        % (cik, acc.replace("-", ""), fname))
+        print("  fts page %d: %d hits (total urls %d)"
+              % (page + 1, len(hits), len(urls)))
         time.sleep(SLEEP)
-    return dirs
+    return urls
 
 
-def filing_xml_url(base):
-    """Find the primary Form 4 XML inside a filing directory."""
+def from_atom_feed():
+    """Fallback: the getcurrent Atom feed. This exact URL is known to work."""
+    url = ("https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent"
+           "&type=4&output=atom")
     try:
-        listing = get(base + "/").decode("utf-8", "ignore")
-    except Exception:
-        return None
-    for x in re.findall(r'href="[^"]*/([^"/]+\.xml)"', listing):
-        if "index" not in x.lower():
-            return "%s/%s" % (base, x)
-    return None
+        raw = get(url).decode("utf-8", "ignore")
+    except Exception as e:
+        print("  atom feed failed: %s" % e)
+        return []
+    dirs, seen = [], set()
+    for h in re.findall(r'href="(https://www\.sec\.gov/Archives/edgar/data/'
+                        r'\d+/\d+/[^"]*-index\.htm)"', raw):
+        b = h.rsplit("/", 1)[0]
+        if b not in seen:
+            seen.add(b)
+            dirs.append(b)
+    print("  atom feed: %d filing directories" % len(dirs))
+
+    urls = []
+    for b in dirs:
+        time.sleep(SLEEP)
+        try:
+            listing = get(b + "/").decode("utf-8", "ignore")
+        except Exception:
+            continue
+        for x in re.findall(r'href="[^"]*/([^"/]+\.xml)"', listing):
+            if "index" not in x.lower():
+                urls.append("%s/%s" % (b, x))
+                break
+    return urls
 
 
 def parse_form4(xml_bytes):
@@ -206,19 +226,26 @@ def score(a):
 
 
 def main():
-    print("Pulling recent Form 4 filings from EDGAR ...")
-    dirs = recent_form4_filings()
-    print("  %d unique filings to check\n" % len(dirs))
+    print("Source 1: EDGAR full-text search ...")
+    urls = from_full_text_search()
+
+    if not urls:
+        print("\nSource 2: EDGAR getcurrent Atom feed ...")
+        urls = from_atom_feed()
+
+    # de-dupe, keep order
+    seen, ordered = set(), []
+    for u in urls:
+        if u not in seen:
+            seen.add(u)
+            ordered.append(u)
+    print("\n%d filings to check\n" % len(ordered))
 
     alerts = []
-    for i, base in enumerate(dirs):
-        time.sleep(SLEEP)
-        xml_url = filing_xml_url(base)
-        if not xml_url:
-            continue
+    for i, xml_url in enumerate(ordered):
         time.sleep(SLEEP)
         try:
-            parsed = parse_form4(get(xml_url))
+            parsed = parse_form4(get(xml_url, tries=2))
         except Exception:
             continue
         if parsed and parsed["total_value"] >= MIN_DOLLARS:
@@ -230,7 +257,7 @@ def main():
                 "{:,}".format(parsed["total_value"]),
                 parsed["insider"]))
         if (i + 1) % 100 == 0:
-            print("  ... %d/%d scanned" % (i + 1, len(dirs)))
+            print("  ... %d/%d scanned" % (i + 1, len(ordered)))
 
     alerts.sort(key=lambda a: -a["score"])
     with open(OUT, "w") as fh:
@@ -238,7 +265,7 @@ def main():
                   fh, indent=2)
     print("\n%d qualifying buys -> %s" % (len(alerts), OUT))
     for a in alerts[:3]:
-        print("  #%d  %s (%s) bought $%s of %s" % (
+        print("  score %d  %s (%s) bought $%s of %s" % (
             a["score"], a["insider"], a["title"],
             "{:,}".format(a["total_value"]), a["ticker"] or "?"))
 

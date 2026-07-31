@@ -4,14 +4,12 @@ INSIDER BUY SCANNER - SEC Form 4 open-market purchase detector.
 
 Finds insiders buying their own company's stock with their own money.
 
-Data sources, in order of preference (SEC 403s some endpoints from cloud
-runners, so we try several and use whichever answers):
-  1. EDGAR full-text search API (efts.sec.gov) - full day coverage
-  2. EDGAR "getcurrent" Atom feed - most recent filings, proven to work
-
-Then for each filing: fetch the XML, keep only TRANSACTION CODE "P"
-(open-market purchase with the insider's own money), score, and rank.
-Ignores grants "A", sales "S", tax withholding "F", gifts "G".
+IMPORTANT - why this retries:
+SEC blocks requests by IP reputation. Shared GitHub runner IPs are often
+already banned by other people's scrapers, so any single run may get 403s.
+Each scheduled run lands on a DIFFERENT runner, so the workflow tries
+several times each morning. This script NEVER overwrites a good alerts.json
+with a blocked or empty result - the first successful run of the day wins.
 
     python3 scanner.py
 
@@ -22,6 +20,7 @@ import gzip
 import json
 import os
 import re
+import sys
 import time
 import urllib.request
 from datetime import date, timedelta
@@ -39,13 +38,16 @@ UA = {
 }
 
 MIN_DOLLARS = 100000     # ignore buys under this
-SLEEP = 0.15             # seconds between SEC requests (rate limit)
+SLEEP = 0.20             # seconds between SEC requests
 OUT = "alerts.json"
 # ----------------------------------------------------------------------
 
+blocked = False          # set True if SEC refuses us
 
-def get(url, tries=3):
-    """Fetch with SEC-compliant headers, gzip handling, and retries."""
+
+def get(url, tries=2):
+    """Fetch with SEC headers, gzip handling, and short retries."""
+    global blocked
     last = None
     for attempt in range(tries):
         try:
@@ -57,50 +59,48 @@ def get(url, tries=3):
                 return data
         except Exception as e:
             last = e
+            if "403" in str(e):
+                blocked = True
             time.sleep(1.5 * (attempt + 1))
     raise last
 
 
 def from_full_text_search():
-    """Primary source: EDGAR full-text search. Returns list of XML URLs."""
+    """Primary source: EDGAR full-text search. Returns XML urls."""
     urls = []
     end = date.today()
-    start = end - timedelta(days=4)          # cover a long weekend
+    start = end - timedelta(days=4)
     base = ("https://efts.sec.gov/LATEST/search-index?q=%22%22&forms=4"
             "&dateRange=custom&startdt=" + start.isoformat() +
             "&enddt=" + end.isoformat())
-    for page in range(40):                   # up to 400 filings
-        url = base + ("&from=%d" % (page * 10))
+    for page in range(40):
         try:
-            raw = get(url).decode("utf-8", "ignore")
-            data = json.loads(raw)
+            data = json.loads(get(base + ("&from=%d" % (page * 10)))
+                              .decode("utf-8", "ignore"))
         except Exception as e:
-            print("  fts page %d stopped: %s" % (page, e))
+            print("  fts stopped at page %d: %s" % (page, e))
             break
         hits = data.get("hits", {}).get("hits", [])
         if not hits:
             break
         for h in hits:
-            hid = h.get("_id", "")           # "0001234567-26-000123:form4.xml"
+            hid = h.get("_id", "")
             ciks = h.get("_source", {}).get("ciks", [])
             if ":" not in hid or not ciks:
                 continue
             acc, fname = hid.split(":", 1)
-            cik = str(int(ciks[0]))          # strip leading zeros
             urls.append("https://www.sec.gov/Archives/edgar/data/%s/%s/%s"
-                        % (cik, acc.replace("-", ""), fname))
-        print("  fts page %d: %d hits (total urls %d)"
-              % (page + 1, len(hits), len(urls)))
+                        % (str(int(ciks[0])), acc.replace("-", ""), fname))
+        print("  fts page %d -> %d urls total" % (page + 1, len(urls)))
         time.sleep(SLEEP)
     return urls
 
 
 def from_atom_feed():
-    """Fallback: the getcurrent Atom feed. This exact URL is known to work."""
-    url = ("https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent"
-           "&type=4&output=atom")
+    """Fallback: the getcurrent Atom feed (no count/start params)."""
     try:
-        raw = get(url).decode("utf-8", "ignore")
+        raw = get("https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent"
+                  "&type=4&output=atom").decode("utf-8", "ignore")
     except Exception as e:
         print("  atom feed failed: %s" % e)
         return []
@@ -111,7 +111,7 @@ def from_atom_feed():
         if b not in seen:
             seen.add(b)
             dirs.append(b)
-    print("  atom feed: %d filing directories" % len(dirs))
+    print("  atom feed -> %d filing directories" % len(dirs))
 
     urls = []
     for b in dirs:
@@ -210,12 +210,12 @@ def score(a):
     else:
         s += 5
     if a["is_ceo"]:
-        s += 30                       # CEO buying own stock = top signal
+        s += 30
     elif a["is_officer"]:
-        s += 20                       # CFO knows the numbers
+        s += 20
     elif a["is_director"]:
         s += 10
-    inc = a["stake_increase_pct"]     # doubling a stake >> topping up 1%
+    inc = a["stake_increase_pct"]
     if inc >= 50:
         s += 20
     elif inc >= 20:
@@ -225,27 +225,46 @@ def score(a):
     return s
 
 
+def existing_is_fresh():
+    """True if alerts.json already holds today's good data."""
+    try:
+        d = json.load(open(OUT))
+    except Exception:
+        return False
+    return d.get("scan_date") == str(date.today()) and len(d.get("alerts", [])) > 0
+
+
 def main():
+    if existing_is_fresh():
+        print("alerts.json is already fresh for today - nothing to do.")
+        return 0
+
     print("Source 1: EDGAR full-text search ...")
     urls = from_full_text_search()
-
     if not urls:
         print("\nSource 2: EDGAR getcurrent Atom feed ...")
         urls = from_atom_feed()
 
-    # de-dupe, keep order
     seen, ordered = set(), []
     for u in urls:
         if u not in seen:
             seen.add(u)
             ordered.append(u)
-    print("\n%d filings to check\n" % len(ordered))
 
+    if not ordered:
+        print("\n*** NO FILINGS RETRIEVED ***")
+        if blocked:
+            print("SEC returned 403 - this runner's IP is blocked.")
+            print("A later scheduled run will land on a different runner.")
+        print("Leaving any existing alerts.json untouched.")
+        return 0          # green: this is expected some mornings
+
+    print("\n%d filings to check\n" % len(ordered))
     alerts = []
     for i, xml_url in enumerate(ordered):
         time.sleep(SLEEP)
         try:
-            parsed = parse_form4(get(xml_url, tries=2))
+            parsed = parse_form4(get(xml_url, tries=1))
         except Exception:
             continue
         if parsed and parsed["total_value"] >= MIN_DOLLARS:
@@ -259,6 +278,10 @@ def main():
         if (i + 1) % 100 == 0:
             print("  ... %d/%d scanned" % (i + 1, len(ordered)))
 
+    if not alerts and blocked:
+        print("\nFilings found but fetches were blocked - not writing.")
+        return 0
+
     alerts.sort(key=lambda a: -a["score"])
     with open(OUT, "w") as fh:
         json.dump({"scan_date": str(date.today()), "alerts": alerts},
@@ -268,7 +291,8 @@ def main():
         print("  score %d  %s (%s) bought $%s of %s" % (
             a["score"], a["insider"], a["title"],
             "{:,}".format(a["total_value"]), a["ticker"] or "?"))
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

@@ -1,0 +1,51 @@
+name: Diagnose SEC access
+
+on:
+  workflow_dispatch:
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Probe SEC endpoints
+        run: |
+          python3 - <<'PY'
+          import urllib.request, urllib.error
+
+          H = {
+              "User-Agent": "Insider Signal diegoball2344@gmail.com",
+              "Accept-Encoding": "gzip, deflate",
+              "Accept": "*/*",
+          }
+
+          TESTS = [
+            ("daily-index .idx",
+             "https://www.sec.gov/Archives/edgar/daily-index/2026/QTR3/form.20260730.idx"),
+            ("daily-index JSON",
+             "https://www.sec.gov/Archives/edgar/daily-index/2026/QTR3/index.json"),
+            ("browse-edgar atom",
+             "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=4&output=atom"),
+            ("efts full-text search",
+             "https://efts.sec.gov/LATEST/search-index?q=%22purchase%22&forms=4"),
+            ("data.sec.gov submissions",
+             "https://data.sec.gov/submissions/CIK0001802974.json"),
+            ("archives form4 xml",
+             "https://www.sec.gov/Archives/edgar/data/1802974/000089914026000708/form4.xml"),
+          ]
+
+          for label, url in TESTS:
+              try:
+                  req = urllib.request.Request(url, headers=H)
+                  with urllib.request.urlopen(req, timeout=25) as r:
+                      body = r.read(300)
+                      print("OK   %-26s %s  %d bytes-peek" % (label, r.status, len(body)))
+              except urllib.error.HTTPError as e:
+                  detail = ""
+                  try:
+                      detail = e.read(200).decode("utf-8", "ignore").replace("\n", " ")
+                  except Exception:
+                      pass
+                  print("FAIL %-26s HTTP %s  %s" % (label, e.code, detail[:160]))
+              except Exception as e:
+                  print("FAIL %-26s %s" % (label, e))
+          PY

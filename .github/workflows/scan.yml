@@ -1,15 +1,24 @@
 name: Daily insider scan
 
-# Runs every weekday morning. Cron is UTC.
-# 11:15 UTC = 7:15 AM Eastern (EDT) / 6:15 AM (EST).
-# SEC posts the previous day's index overnight, so this catches it.
+# SEC blocks some GitHub runner IPs (shared, burned by other scrapers).
+# Each run gets a DIFFERENT runner, so we try several times each morning.
+# The scanner refuses to overwrite good data with a blocked/empty run,
+# so the first success wins and later attempts are harmless.
 on:
   schedule:
-    - cron: "15 11 * * 2-6"   # Tue-Sat UTC = Mon-Fri filings
-  workflow_dispatch:           # lets you run it by hand from the Actions tab
+    - cron: "15 11 * * 2-6"   # 7:15 AM ET
+    - cron: "45 11 * * 2-6"   # 7:45 AM ET
+    - cron: "15 12 * * 2-6"   # 8:15 AM ET
+    - cron: "45 12 * * 2-6"   # 8:45 AM ET
+    - cron: "15 13 * * 2-6"   # 9:15 AM ET
+  workflow_dispatch:
 
 permissions:
-  contents: write              # needed to commit alerts.json back to the repo
+  contents: write
+
+concurrency:
+  group: insider-scan
+  cancel-in-progress: false
 
 jobs:
   scan:
@@ -26,24 +35,24 @@ jobs:
       - name: Run the scanner
         env:
           SEC_CONTACT: ${{ secrets.SEC_CONTACT }}
-        run: |
-          python3 scripts/scanner.py
-          echo "--- result ---"
-          python3 -c "import json;d=json.load(open('alerts.json'));print(d['scan_date'], len(d['alerts']), 'qualifying buys')"
+        run: python3 scripts/scanner.py
 
       - name: Commit results if anything changed
         run: |
           git config user.name  "insider-signal-bot"
           git config user.email "actions@github.com"
-          git add alerts.json
+          git pull --rebase --autostash || true
+          git add -A alerts.json
           if git diff --staged --quiet; then
-            echo "No change — nothing to commit."
+            echo "No change - nothing to commit."
           else
-            git commit -m "scan: $(date -u +%Y-%m-%d)"
+            git commit -m "scan: $(date -u +%Y-%m-%dT%H:%M)"
             git push
+            echo "Committed new results."
           fi
 
-      - name: Upload alerts.json as a downloadable artifact
+      - name: Upload alerts.json
+        if: hashFiles('alerts.json') != ''
         uses: actions/upload-artifact@v4
         with:
           name: alerts-${{ github.run_number }}
